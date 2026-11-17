@@ -1,4 +1,4 @@
-"""Hour-by-hour Twitch CCU forecaster for a big game launch day -- v2.
+"""Hour-by-hour Twitch CCU forecaster for a big game launch day -- v3.
 
 Entry for make.fun's gta6-twitch-ccu-forecast-01. The program reads one case
 file (schema makefun/twitch-ccu-case/v1): everything recorded up to the end of
@@ -7,10 +7,9 @@ histories of dozens of past big launches (the case's `comparables`). For each
 of hours 2..24 it writes five quantiles of the hour's mean concurrent viewers
 in the game's Twitch category.
 
-Method (a refinement of the level regression this entry's predecessor used,
-re-calibrated by leave-one-out over the comparable launches themselves --
-each in turn forecast from the others with the contest's pinball-on-log
-loss):
+Method (the level regression of this entry's predecessors, re-calibrated by
+leave-one-out over the comparable launches themselves -- each in turn
+forecast from the others with the contest's pinball-on-log loss):
 
   A launch day's level regresses on the log of its hour-1 print with a slope
   well under 1: a huge first hour means much of the audience arrived at once
@@ -39,10 +38,25 @@ loss):
      while its median was already calibrated. So the scale is now 1.0 for
      the 0.05/0.25/0.75/0.95 quantiles and stays 0.8 at the median.
 
+  3. A branch for simultaneous-unlock targets whose hour 1 is still a
+     pre-unlock trickle (new in v3). When a launch unlocks at one worldwide
+     moment stated in the notes and that moment is still ahead at hour 1,
+     the hour-1 print is the waiting audience, not the launch's scale --
+     the regression reads it as a tiny launch and misses the day by orders
+     of magnitude (the worst single leave-one-out loss of v2, 1.63, was
+     exactly this). If the target's unlock class is simultaneous, its
+     unlock time is stated, and its hour-1 print is a trickle against the
+     peaks of the clean single-unlock comparables (their own hour 1
+     likewise a trickle), the forecast instead takes pre-unlock hours
+     from those comparables' pooled pre-unlock behaviour and post-unlock
+     hours from their curves aligned at their unlock moments, in absolute
+     viewers. Every other target -- a rolling-midnight launch like this
+     one included -- takes the standard fit above, unchanged.
+
   Leave-one-out over the 37 usable comparable launches: mean pinball-on-log
-  loss 0.373 against the predecessor's 0.419 and the persistence baseline's
-  0.930; on the rolling-midnight class this launch belongs to, 0.227 against
-  0.232 (house-style baseline 0.357).
+  loss 0.347 against the predecessor's 0.373 and the persistence baseline's
+  0.930; on the rolling-midnight class this launch belongs to, 0.227,
+  unchanged from the predecessor (house-style baseline 0.357).
 
   If a case carries too few usable comparables, the program falls back to
   persistence: every hour at hour 1's print with a lognormal spread of
@@ -59,6 +73,7 @@ Run locally:
 import json
 import math
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -114,6 +129,104 @@ def target_class(case):
     if notes is None:
         return "rolling"
     return unlock_class(notes)
+
+
+def unlock_hour(text):
+    """The UTC hour of a single global unlock moment stated in a note, or
+    None. Prefers a full ISO timestamp (…T14:00Z), then the start of an
+    hour range (14:00-15:00Z), then a bare HH:00Z."""
+    u = text or ""
+    found = re.findall(r"T(\d{2}):00Z", u)
+    if found:
+        return int(found[-1])
+    match = re.search(r"(\d{2}):00-\d{2}:00Z", u)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"(\d{2}):00Z", u)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+# A launch whose hour-1 print is under this fraction of its own day peak
+# was still a pre-unlock trickle at hour 1 (used both for the target
+# trigger and for admitting a comparable to the simult pool).
+TRICKLE_FRAC = 0.10
+
+
+def simult_quantiles(case, p1, levels):
+    """Forecast for a single-global-unlock target whose hour 1 is still a
+    pre-unlock trickle, or None when the situation does not apply.
+
+    When a launch unlocks at one worldwide moment stated in the notes and
+    that moment is still ahead at hour 1, the hour-1 print says nothing
+    about the day's scale: it is the pre-launch audience waiting. The
+    level regression would read it as a tiny launch and miss the day by
+    orders of magnitude. Instead: hours before the unlock are forecast
+    from the pooled pre-unlock behaviour of comparable single-unlock
+    launches (their pre-unlock hours relative to their own hour-1
+    prints), and hours from the unlock on are forecast from those
+    launches' curves aligned at their own unlock moments, in absolute
+    viewers (a launch whose aligned curve ends earlier is carried at its
+    day-end level). The pool admits only clean single-unlock comparables
+    whose own hour 1 was likewise a trickle — an early-access launch,
+    whose day was already live at hour 1, does not belong to it. The
+    branch fires only when the target's hour-1 print is a trickle against
+    the pool's typical peak; every other target takes the standard fit.
+    """
+    if target_class(case) != "simult":
+        return None
+    u = unlock_hour(case.get("notes"))
+    if u is None:
+        return None
+    pool = []
+    for comparable in case.get("comparables") or []:
+        if "before release" in (comparable.get("name") or ""):
+            continue
+        if unlock_class(comparable.get("unlock")) != "simult":
+            continue
+        ui = unlock_hour(comparable.get("unlock"))
+        if ui is None:
+            continue
+        hours = launch_day_hours(comparable)
+        if hours is None:
+            continue
+        peak = max(hours.values())
+        if not hours[1] < TRICKLE_FRAC * peak:
+            continue
+        pool.append((hours, ui, peak))
+    if len(pool) < 2:
+        return None
+    peaks = sorted(peak for _, _, peak in pool)
+    med_peak = peaks[len(peaks) // 2]
+    if not p1 < TRICKLE_FRAC * med_peak:
+        return None
+    u_idx = u + 1  # the day-hour whose start is the unlock moment
+    trickle = []
+    for hours, ui, _ in pool:
+        base = math.log(hours[1])
+        for h in range(1, ui + 1):
+            if h in hours:
+                trickle.append((math.log(max(1, hours[h])) - base, 1.0))
+    out = {}
+    for h in HOURS:
+        if h < u_idx:
+            if trickle:
+                qs = [p1 * math.exp(weighted_quantile(trickle, tau)) for tau in levels]
+            else:
+                qs = [float(p1)] * len(levels)
+        else:
+            s = h - u_idx + 1  # hours since the unlock moment, 1-based
+            vals = []
+            for hours, ui, _ in pool:
+                hh = min(24, ui + s)
+                if hh in hours:
+                    vals.append((math.log(max(1, hours[hh])), 1.0))
+            if not vals:
+                vals = [(math.log(max(1, p1)), 1.0)]
+            qs = [math.exp(weighted_quantile(vals, tau)) for tau in levels]
+        out[h] = qs
+    return out
 
 
 def round2(x):
@@ -266,10 +379,16 @@ def forecast_case(case):
     ln_p1 = math.log(p1)
     train = training_rows(case, target_class(case))
     fits = fit_curves(train, ln_p1) if len(train) >= MIN_TRAIN else None
+    try:
+        sim = simult_quantiles(case, p1, levels)
+    except Exception:
+        sim = None
     hours_out = []
     for row in case.get("forecast") or []:
         h = row["hour"]
-        if fits is not None and h in HOURS:
+        if sim is not None and h in sim:
+            qs = list(sim[h])
+        elif fits is not None and h in HOURS:
             a_list, b_list, offsets = fits
             i = h - 2
             pred = a_list[i] + b_list[i] * ln_p1
