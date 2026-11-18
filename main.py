@@ -1,4 +1,4 @@
-"""Hour-by-hour Twitch CCU forecaster for a big game launch day -- v3.
+"""Hour-by-hour Twitch CCU forecaster for a big game launch day -- v4.
 
 Entry for make.fun's gta6-twitch-ccu-forecast-01. The program reads one case
 file (schema makefun/twitch-ccu-case/v1): everything recorded up to the end of
@@ -39,7 +39,7 @@ forecast from the others with the contest's pinball-on-log loss):
      the 0.05/0.25/0.75/0.95 quantiles and stays 0.8 at the median.
 
   3. A branch for simultaneous-unlock targets whose hour 1 is still a
-     pre-unlock trickle (new in v3). When a launch unlocks at one worldwide
+     pre-unlock trickle (added in v3). When a launch unlocks at one worldwide
      moment stated in the notes and that moment is still ahead at hour 1,
      the hour-1 print is the waiting audience, not the launch's scale --
      the regression reads it as a tiny launch and misses the day by orders
@@ -53,10 +53,24 @@ forecast from the others with the contest's pinball-on-log loss):
      viewers. Every other target -- a rolling-midnight launch like this
      one included -- takes the standard fit above, unchanged.
 
+  4. Shrinkage of that branch toward the standard fit (new in v4). The
+     branch is a high-variance estimator: its pool holds only two or
+     three launches, so its absolute transfer overshoots a target whose
+     day settles below the pool's (one leave-one-out fold went 0.60
+     without the branch to 0.80 with it, even as another fell 1.63 to
+     0.43). v4 therefore blends the branch's quantiles with the standard
+     fit's, in log space, at a fixed weight of 0.75 on the branch --
+     partial pooling between the two models. Leave-one-out over the same
+     folds: every launch the branch touches improves (1.63's fold falls
+     further, to 0.23; the overshoot fold recovers to 0.62), and no other
+     launch's forecast changes at all, so the rolling-midnight class is
+     untouched. The weight sits on a flat stretch of the leave-one-out
+     response (0.70 and 0.80 score within 0.001 of 0.75), not on a spike.
+
   Leave-one-out over the 37 usable comparable launches: mean pinball-on-log
-  loss 0.347 against the predecessor's 0.373 and the persistence baseline's
+  loss 0.335 against v3's 0.347, v2's 0.373 and the persistence baseline's
   0.930; on the rolling-midnight class this launch belongs to, 0.227,
-  unchanged from the predecessor (house-style baseline 0.357).
+  unchanged from v3 (house-style baseline 0.357).
 
   If a case carries too few usable comparables, the program falls back to
   persistence: every hour at hour 1's print with a lognormal spread of
@@ -94,6 +108,11 @@ MIN_DAY_HOURS = 18   # of hours 2..24 a comparable must report to count
 # Spread scale per scored quantile level (see the docstring: the quartiles
 # and tails were escaping at 0.8, the median was not).
 SPREAD_SCALE = {0.05: 1.0, 0.25: 1.0, 0.5: 0.8, 0.75: 1.0, 0.95: 1.0}
+
+# Log-space weight on the simult-trickle branch when it fires (v4): the
+# branch's small-pool absolute transfer is shrunk a quarter of the way
+# toward the standard level fit. See docstring point 4.
+BRANCH_WEIGHT = 0.75
 
 SIMULTANEOUS_MARKERS = [
     "simultaneous", "single global", "single simultaneous", "one time",
@@ -386,20 +405,33 @@ def forecast_case(case):
     hours_out = []
     for row in case.get("forecast") or []:
         h = row["hour"]
-        if sim is not None and h in sim:
-            qs = list(sim[h])
-        elif fits is not None and h in HOURS:
+        std = None
+        if fits is not None and h in HOURS:
             a_list, b_list, offsets = fits
             i = h - 2
             pred = a_list[i] + b_list[i] * ln_p1
-            qs = []
+            std = []
             for tau in levels:
                 if tau in offsets:
                     off = offsets[tau][i]
                 else:
                     column = [offsets[t][i] for t in LEVELS]
                     off = _interp_tau(LEVELS, column, tau)
-                qs.append(math.exp(pred + off))
+                std.append(math.exp(pred + off))
+            for j in range(1, len(std)):
+                if std[j] < std[j - 1]:
+                    std[j] = std[j - 1]
+        if sim is not None and h in sim:
+            qs = list(sim[h])
+            if std is not None:
+                # v4: shrink the branch toward the standard fit, in log
+                # space (docstring point 4). With no fit to shrink toward
+                # the branch stands as it did in v3.
+                qs = [math.exp(BRANCH_WEIGHT * math.log(max(1e-9, s)) +
+                               (1.0 - BRANCH_WEIGHT) * math.log(max(1e-9, t)))
+                      for s, t in zip(qs, std)]
+        elif std is not None:
+            qs = std
         else:
             qs = baseline_quantiles(p1, h, levels)
         # contract: positive, at most 1e9, non-decreasing in tau
